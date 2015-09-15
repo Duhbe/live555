@@ -37,7 +37,7 @@ void streamTimerHandler(void* clientData);
   // called at the end of a stream's expected duration (if the stream has not already signaled its end using a RTCP "BYE")
 
 // The main streaming routine (for each "rtsp://" URL):
-void openURL(UsageEnvironment& env, char const* progName, char const* rtspURL);
+void openURL(UsageEnvironment& env, char const* progName, char const* rtspURL, char const * rtp_destination, unsigned short rtp_client_port);
 
 // Used to iterate through each stream's 'subsessions', setting up each one:
 void setupNextSubsession(RTSPClient* rtspClient);
@@ -56,8 +56,10 @@ UsageEnvironment& operator<<(UsageEnvironment& env, const MediaSubsession& subse
 }
 
 void usage(UsageEnvironment& env, char const* progName) {
-  env << "Usage: " << progName << " <rtsp-url-1> ... <rtsp-url-N>\n";
-  env << "\t(where each <rtsp-url-i> is a \"rtsp://\" URL)\n";
+  env << "Usage: " << progName << " <rtsp-url> [<destination> [<client_port>]]\n";
+  env << "\twhere\t<rtsp-url> is a \"rtsp://\" URL)\n";
+  env << "\t\t<destination> is the RTP destination address, which may be different from RTSP client address\n";
+  env << "\t\t<client_port> is the RTP client port number\n";
 }
 
 char eventLoopWatchVariable = 0;
@@ -73,10 +75,19 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // There are argc-1 URLs: argv[1] through argv[argc-1].  Open and start streaming each one:
-  for (int i = 1; i <= argc-1; ++i) {
-    openURL(*env, argv[0], argv[i]);
+  char * rtp_destination = NULL;
+  if (argc >= 3)
+    rtp_destination = argv[2];
+  
+  int rtp_client_port = 0;
+  if (argc >= 4) {
+    if (sscanf(argv[3], "%d", &rtp_client_port) != 1) {
+        usage(*env, argv[0]);
+        return 1;
+    }
   }
+
+  openURL(*env, argv[0], argv[1], rtp_destination, rtp_client_port);
 
   // All subsequent activity takes place within the event loop:
   env->taskScheduler().doEventLoop(&eventLoopWatchVariable);
@@ -118,16 +129,42 @@ public:
   static ourRTSPClient* createNew(UsageEnvironment& env, char const* rtspURL,
 				  int verbosityLevel = 0,
 				  char const* applicationName = NULL,
-				  portNumBits tunnelOverHTTPPortNum = 0);
+				  portNumBits tunnelOverHTTPPortNum = 0,
+				  char const * rtp_destination = NULL,
+				  unsigned short rtp_client_port = 0);
 
 protected:
   ourRTSPClient(UsageEnvironment& env, char const* rtspURL,
-		int verbosityLevel, char const* applicationName, portNumBits tunnelOverHTTPPortNum);
+		int verbosityLevel, char const* applicationName, portNumBits tunnelOverHTTPPortNum,
+		char const * rtp_destination, unsigned short rtp_client_port);
     // called only by createNew();
   virtual ~ourRTSPClient();
 
+  //override SETUP command, specify the third-party destination in "Transport:".
+  Boolean setRequestFields(RequestRecord* request,
+  					     char*& cmdURL, Boolean& cmdURLWasAllocated,
+  					     char const*& protocolStr,
+  					     char*& extraHeaders, Boolean& extraHeadersWereAllocated) {
+    if (strcmp(request->commandName(), "SETUP") == 0) {
+      Boolean streamUsingTCP = (request->booleanFlags()&0x1) != 0;
+      if (!streamUsingTCP && fRTPDestination && fRTPClientPort) {
+        extraHeadersWereAllocated = True;
+        extraHeaders = new char[128];
+	    if (strcmp(request->subsession()->protocolName(), "UDP") == 0)
+          sprintf(extraHeaders, "Transport: RAW/RAW/UDP;unicast;destination=%s;client_port=%d-%d\r\n", fRTPDestination, fRTPClientPort, fRTPClientPort + 1);
+        else
+          sprintf(extraHeaders, "Transport: RTP/AVP;unicast;destination=%s;client_port=%d-%d\r\n", fRTPDestination, fRTPClientPort, fRTPClientPort + 1);
+        return True;
+      }
+    }
+
+    return RTSPClient::setRequestFields(request, cmdURL, cmdURLWasAllocated, protocolStr, extraHeaders, extraHeadersWereAllocated);
+  }
+  
 public:
   StreamClientState scs;
+  char const* fRTPDestination;
+  unsigned short fRTPClientPort;
 };
 
 // Define a data sink (a subclass of "MediaSink") to receive the data for each subsession (i.e., each audio or video 'substream').
@@ -167,10 +204,10 @@ private:
 
 static unsigned rtspClientCount = 0; // Counts how many streams (i.e., "RTSPClient"s) are currently in use.
 
-void openURL(UsageEnvironment& env, char const* progName, char const* rtspURL) {
+void openURL(UsageEnvironment& env, char const* progName, char const* rtspURL, char const * rtp_destination, unsigned short rtp_client_port) {
   // Begin by creating a "RTSPClient" object.  Note that there is a separate "RTSPClient" object for each stream that we wish
   // to receive (even if more than stream uses the same "rtsp://" URL).
-  RTSPClient* rtspClient = ourRTSPClient::createNew(env, rtspURL, RTSP_CLIENT_VERBOSITY_LEVEL, progName);
+  RTSPClient* rtspClient = ourRTSPClient::createNew(env, rtspURL, RTSP_CLIENT_VERBOSITY_LEVEL, progName, 0, rtp_destination, rtp_client_port);
   if (rtspClient == NULL) {
     env << "Failed to create a RTSP client for URL \"" << rtspURL << "\": " << env.getResultMsg() << "\n";
     return;
@@ -435,13 +472,17 @@ void shutdownStream(RTSPClient* rtspClient, int exitCode) {
 // Implementation of "ourRTSPClient":
 
 ourRTSPClient* ourRTSPClient::createNew(UsageEnvironment& env, char const* rtspURL,
-					int verbosityLevel, char const* applicationName, portNumBits tunnelOverHTTPPortNum) {
-  return new ourRTSPClient(env, rtspURL, verbosityLevel, applicationName, tunnelOverHTTPPortNum);
+					int verbosityLevel, char const* applicationName, portNumBits tunnelOverHTTPPortNum,
+					char const * rtp_destination, unsigned short rtp_client_port) {
+  return new ourRTSPClient(env, rtspURL, verbosityLevel, applicationName, tunnelOverHTTPPortNum, rtp_destination, rtp_client_port);
 }
 
 ourRTSPClient::ourRTSPClient(UsageEnvironment& env, char const* rtspURL,
-			     int verbosityLevel, char const* applicationName, portNumBits tunnelOverHTTPPortNum)
-  : RTSPClient(env,rtspURL, verbosityLevel, applicationName, tunnelOverHTTPPortNum, -1) {
+			     int verbosityLevel, char const* applicationName, portNumBits tunnelOverHTTPPortNum,
+			     char const * rtp_destination, unsigned short rtp_client_port)
+  : RTSPClient(env,rtspURL, verbosityLevel, applicationName, tunnelOverHTTPPortNum, -1),
+    fRTPDestination(rtp_destination),
+    fRTPClientPort(rtp_client_port) {
 }
 
 ourRTSPClient::~ourRTSPClient() {
